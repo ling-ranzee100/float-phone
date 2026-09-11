@@ -38,10 +38,22 @@ import { loadMomentsConfig, saveMomentsConfig } from "@/lib/moments-storage";
 import type { CanvasBgItem } from "@/lib/character-types";
 import { PageShell } from "@/components/ui/page-shell";
 import { ConfirmDialog } from "@/components/ui/modal";
-import { AlertCircle } from "lucide-react";
+import { AlertCircle, History } from "lucide-react";
+import {
+  backupCharacterVersion,
+  clearCharacterVersions,
+  deleteCharacterVersion,
+  getCharacterCurrentVersion,
+  getCharacterNextVersion,
+  loadCharacterVersions,
+  overwriteCharacterVersion,
+  switchCharacterVersion,
+  type CharacterVersion,
+} from "@/lib/character-version-storage";
 import { notifyMascotPageContext } from "@/lib/mascot-events";
 import { kvGet, kvSet } from "@/lib/kv-db";
 import { normalizeTimeZone } from "@/lib/character-time";
+import { removeCharacterChatReferences } from "@/lib/character-chat-cleanup";
 
 type ViewType = "list" | "detail";
 
@@ -51,6 +63,17 @@ type CanvasRelationLine = { key: string; aId: string; bId: string; labels: strin
 // 每个世界一张画布：平移缩放记忆按世界分 key（默认世界沿用旧 key，存量零迁移）
 const PAN_STORAGE_BASE_KEY = 'ai_phone_canvas_pan_v2';
 const WORLD_TAB_KEY = 'ai_phone_character_app_world_v1';
+const CHARACTER_AVATAR_MAX_BYTES = 600 * 1024;
+const CHARACTER_AVATAR_COMPRESSION_FALLBACKS = [
+  { maxSize: 1280, quality: 0.8 },
+  { maxSize: 1024, quality: 0.8 },
+  { maxSize: 1024, quality: 0.72 },
+  { maxSize: 768, quality: 0.72 },
+  { maxSize: 640, quality: 0.68 },
+  { maxSize: 512, quality: 0.64 },
+  { maxSize: 400, quality: 0.6 },
+  { maxSize: 320, quality: 0.56 },
+] as const;
 function worldPanKey(worldId: string): string {
   return worldId === DEFAULT_CHARACTER_WORLD_ID ? PAN_STORAGE_BASE_KEY : `${PAN_STORAGE_BASE_KEY}_${worldId}`;
 }
@@ -239,6 +262,7 @@ export function PhoneCharacterApp({ onClose, onNotice }: PhoneCharacterAppProps)
           <CharArchiveView
             char={view.id ? (characters.find((c) => c.id === view.id) ?? createCharacter({ name: "", persona: "", avatar: null })) : createCharacter({ name: "", persona: "", avatar: null })}
             isEditing={view.isEditing}
+            isExisting={Boolean(view.id)}
             onBack={handleBackFromDetail}
             onEdit={() => setView({ type: "detail", id: view.id, isEditing: true })}
             onCancelEdit={() => {
@@ -248,9 +272,12 @@ export function PhoneCharacterApp({ onClose, onNotice }: PhoneCharacterAppProps)
                 setView({ type: "list", id: null, isEditing: false });
               }
             }}
-            onSave={(data) => {
+            onSave={(data, createVersion) => {
               const existing = view.id ? characters.find((c) => c.id === view.id) : null;
               if (existing) {
+                const nextVersion = createVersion
+                  ? backupCharacterVersion(existing, "manual", "手动编辑前备份")
+                  : overwriteCharacterVersion(existing.id);
                 const updated: Character = {
                   ...existing,
                   ...data,
@@ -258,7 +285,9 @@ export function PhoneCharacterApp({ onClose, onNotice }: PhoneCharacterAppProps)
                 };
                 updateChars(characters.map((c) => (c.id === existing.id ? updated : c)));
                 setView({ type: "detail", id: existing.id, isEditing: false });
-                onNotice("档案已更新");
+                onNotice(createVersion
+                  ? `已备份旧卡，当前为 V${nextVersion}`
+                  : `已覆盖旧版本，当前为 V${nextVersion}`);
               } else {
                 const newChar = createCharacter(data);
                 newChar.polaroidStyle = pendingPolaroidStyle;
@@ -267,9 +296,26 @@ export function PhoneCharacterApp({ onClose, onNotice }: PhoneCharacterAppProps)
                 onNotice("点击画布放置角色");
               }
             }}
-            onDelete={() => {
-              if (view.id) {
-                updateChars(characters.filter((c) => c.id !== view.id));
+            onRestoreVersion={(version) => {
+              const existing = view.id ? characters.find((c) => c.id === view.id) : null;
+              if (!existing) return;
+              const activeVersion = switchCharacterVersion(existing, version);
+              const restored: Character = {
+                ...version.data,
+                id: existing.id,
+                createdAt: existing.createdAt,
+                updatedAt: new Date().toISOString(),
+              };
+              updateChars(characters.map((c) => (c.id === existing.id ? restored : c)));
+              setView({ type: "detail", id: existing.id, isEditing: false });
+              onNotice(`已切换到 V${activeVersion}，未创建新版本`);
+            }}
+            onDelete={async () => {
+              const characterId = view.id;
+              if (characterId) {
+                await removeCharacterChatReferences(characterId);
+                clearCharacterVersions(characterId);
+                updateChars(characters.filter((c) => c.id !== characterId));
               }
               setView({ type: "list", id: null, isEditing: false });
               onNotice("已删除档案");
@@ -285,6 +331,7 @@ export function PhoneCharacterApp({ onClose, onNotice }: PhoneCharacterAppProps)
                 onNotice("导出成功");
               }
             }}
+            onNotice={onNotice}
           />
         )}
       </div>
@@ -631,6 +678,7 @@ function CharListView({
   }
   const [deleteConfirm, setDeleteConfirm] = useState<{ id: string, type: 'char' | 'bg' } | null>(null);
   const [deleteConfirmReady, setDeleteConfirmReady] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
   const [isAnyDragging, setIsAnyDragging] = useState(false);
   const [overTrashBin, setOverTrashBin] = useState(false);
   // 拖拽结束（含取消）时清掉世界 tab 的归档高亮
@@ -650,6 +698,7 @@ function CharListView({
   useEffect(() => {
     if (!deleteConfirm) {
       setDeleteConfirmReady(false);
+      setDeleteBusy(false);
       return;
     }
     setDeleteConfirmReady(false);
@@ -1133,6 +1182,7 @@ function CharListView({
                   onEditTap={handleCharEditTap}
                   onDragMoveAt={handleCharDragMoveAt}
                   onDropAt={handleCharDropAt}
+                  use2dTransform
                   trashBinRef={trashBinRef}
                   onDragActiveChange={setIsAnyDragging}
                   onOverTrashChange={setOverTrashBin}
@@ -1274,31 +1324,43 @@ function CharListView({
           className="modal-overlay"
           style={{ zIndex: 8000000, backdropFilter: "blur(var(--ui-blur-light))" }}
           onClick={() => {
-            if (deleteConfirmReady) setDeleteConfirm(null);
+            if (deleteConfirmReady && !deleteBusy) setDeleteConfirm(null);
           }}
         >
           <div className="char-punched-hole-note" onClick={(e) => e.stopPropagation()}>
             <h3>销毁确认</h3>
-            <p>您确定要丢弃该档案或物件吗？此操作将永远无法恢复。</p>
+            <p>{deleteConfirm.type === "char"
+              ? "角色档案、联系人及与该角色的单聊记录将一并删除；角色会从群聊成员中移除，但群聊和群聊历史会保留。此操作无法恢复。"
+              : "您确定要丢弃该物件吗？此操作将永远无法恢复。"}</p>
             <div className="char-punched-hole-btn-group">
               <button
                 className="char-punched-hole-btn"
-                disabled={!deleteConfirmReady}
+                disabled={!deleteConfirmReady || deleteBusy}
                 onClick={() => {
-                  if (deleteConfirmReady) setDeleteConfirm(null);
+                  if (deleteConfirmReady && !deleteBusy) setDeleteConfirm(null);
                 }}
               >驳回申请</button>
-              <button className="char-punched-hole-btn danger" disabled={!deleteConfirmReady} onClick={() => {
-                if (!deleteConfirmReady) return;
-                if (deleteConfirm.type === 'char') {
-                  onUpdateChars(characters.filter(c => c.id !== deleteConfirm.id));
-                  onNotice?.("已销毁调查档案");
-                } else {
-                  onUpdateBgItems((bgItems || []).filter(b => b.id !== deleteConfirm.id));
-                  onNotice?.("已销毁散落物件");
+              <button className="char-punched-hole-btn danger" disabled={!deleteConfirmReady || deleteBusy} onClick={async () => {
+                if (!deleteConfirmReady || deleteBusy) return;
+                const target = deleteConfirm;
+                setDeleteBusy(true);
+                try {
+                  if (target.type === 'char') {
+                    await removeCharacterChatReferences(target.id);
+                    clearCharacterVersions(target.id);
+                    onUpdateChars(characters.filter(c => c.id !== target.id));
+                    onNotice?.("已销毁调查档案");
+                  } else {
+                    onUpdateBgItems((bgItems || []).filter(b => b.id !== target.id));
+                    onNotice?.("已销毁散落物件");
+                  }
+                  setDeleteConfirm(null);
+                } catch (error) {
+                  console.error("[Character] delete failed:", error);
+                  setDeleteBusy(false);
+                  onNotice?.("删除失败，请重试");
                 }
-                setDeleteConfirm(null);
-              }}>批准销毁</button>
+              }}>{deleteBusy ? "销毁中…" : "批准销毁"}</button>
             </div>
           </div>
         </div>
@@ -1568,7 +1630,7 @@ function CharListView({
 function DraggableNode({
   id, x, y, rot, zIndex, children, onDragEnd, onClick, className, w, isEditing, onDeleteIntent,
   trashBinRef, onDragActiveChange, onOverTrashChange, zoom = 1, pinchRef,
-  onEditTap, onDragMoveAt, onDropAt
+  onEditTap, onDragMoveAt, onDropAt, use2dTransform = false
 }: {
   id: string; x: number; y: number; rot: number; zIndex: number;
   children: React.ReactNode;
@@ -1587,6 +1649,8 @@ function DraggableNode({
   onDragMoveAt?: (clientX: number, clientY: number) => void;
   /** 松手时的落点处理；返回 true 表示已被消费（如归档进其他世界），位置回弹 */
   onDropAt?: (id: string, clientX: number, clientY: number) => boolean;
+  /** 使用二维位移，避免 3D 合成导致档案墙图片重采样模糊 */
+  use2dTransform?: boolean;
 }) {
   const [pos, setPos] = useState({ x, y });
   const [isDragging, setIsDragging] = useState(false);
@@ -1708,7 +1772,9 @@ function DraggableNode({
       onClickCapture={handleClick}
       style={{
         width: w,
-        transform: `translate3d(${pos.x}px, ${pos.y}px, 0) rotate(${rot}deg)`,
+        transform: use2dTransform
+          ? `translate(${pos.x}px, ${pos.y}px) rotate(${rot}deg)`
+          : `translate3d(${pos.x}px, ${pos.y}px, 0) rotate(${rot}deg)`,
         zIndex: isDragging ? 9999999 : zIndex,
         cursor: isDragging ? 'grabbing' : 'grab',
         touchAction: 'none',
@@ -1726,28 +1792,40 @@ function DraggableNode({
 function CharArchiveView({
   char,
   isEditing = false,
+  isExisting = false,
   onBack,
   onEdit,
   onCancelEdit,
   onSave,
+  onRestoreVersion,
   onDelete,
   onExportJson,
   onExportPng,
+  onNotice = () => { },
   dummy,
 }: {
   char: Character;
   isEditing?: boolean;
+  isExisting?: boolean;
   onBack: () => void;
   onEdit: () => void;
   onCancelEdit?: () => void;
-  onSave?: (data: CharacterImportData) => void;
-  onDelete: () => void;
+  onSave?: (data: CharacterImportData, createVersion: boolean) => void;
+  onRestoreVersion?: (version: CharacterVersion) => void;
+  onDelete: () => void | Promise<void>;
   onExportJson: () => void;
   onExportPng: () => Promise<void>;
+  onNotice?: (text: string) => void;
   dummy?: boolean;
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
   const [showUnsavedConfirm, setShowUnsavedConfirm] = useState<"back" | "cancel" | null>(null);
+  const [showSaveVersionConfirm, setShowSaveVersionConfirm] = useState(false);
+  const [showVersions, setShowVersions] = useState(false);
+  const [versions, setVersions] = useState<CharacterVersion[]>([]);
+  const [restoreTarget, setRestoreTarget] = useState<CharacterVersion | null>(null);
+  const [deleteVersionTarget, setDeleteVersionTarget] = useState<CharacterVersion | null>(null);
   const [name, setName] = useState(char.name || "");
   const [persona, setPersona] = useState(char.persona || "");
   const [personality, setPersonality] = useState(char.personality || "");
@@ -1762,6 +1840,7 @@ function CharArchiveView({
   const [avatar, setAvatar] = useState<string | null>(char.avatar || null);
   const [showUrlInput, setShowUrlInput] = useState(false);
   const [urlInput, setUrlInput] = useState("");
+  const [avatarBusy, setAvatarBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   // Send mascot page context (on mount + field changes)
@@ -1841,8 +1920,21 @@ function CharArchiveView({
   }, [isEditing, char]);
 
   async function handleAvatarFile(file: File) {
-    const url = await fileToDataUrl(file);
-    setAvatar(url);
+    setAvatarBusy(true);
+    try {
+      const url = await fileToDataUrl(file, {
+        maxSize: 1280,
+        quality: 0.86,
+        maxBytes: CHARACTER_AVATAR_MAX_BYTES,
+        fallbacks: CHARACTER_AVATAR_COMPRESSION_FALLBACKS,
+      });
+      setAvatar(url);
+    } catch (error) {
+      console.error("Failed to optimize character avatar", error);
+      onNotice(error instanceof Error ? error.message : "图片处理失败，请更换图片");
+    } finally {
+      setAvatarBusy(false);
+    }
   }
 
   function handleAvatarUrl() {
@@ -1862,7 +1954,7 @@ function CharArchiveView({
     setTagInput("");
   }
 
-  function handleSave() {
+  function commitSave(createVersion: boolean) {
     const trimmedTimeZone = timeZone.trim();
     const normalizedTimeZone = trimmedTimeZone ? normalizeTimeZone(trimmedTimeZone) : undefined;
     if (onSave) {
@@ -1879,8 +1971,27 @@ function CharArchiveView({
         timeZone: normalizedTimeZone,
         tags,
         avatar: avatar ?? null
-      });
+      }, createVersion);
     }
+  }
+
+  function handleSave() {
+    if (isExisting) {
+      setShowSaveVersionConfirm(true);
+    } else {
+      commitSave(false);
+    }
+  }
+
+  function openVersionHistory() {
+    setVersions(loadCharacterVersions(char.id));
+    setShowVersions(true);
+  }
+
+  function removeVersion(version: CharacterVersion) {
+    deleteCharacterVersion(char.id, version.id);
+    setVersions(loadCharacterVersions(char.id));
+    setDeleteVersionTarget(null);
   }
 
   async function handleGenerateBrief() {
@@ -1954,9 +2065,9 @@ function CharArchiveView({
           <div className="char-archive-left">
             <div
               className="char-archive-photo relative"
-              style={{ cursor: isEditing ? "pointer" : "default" }}
+              style={{ cursor: avatarBusy ? "wait" : isEditing ? "pointer" : "default" }}
               onClick={() => {
-                if (isEditing) {
+                if (isEditing && !avatarBusy) {
                   fileRef.current?.click();
                 }
               }}
@@ -1969,7 +2080,7 @@ function CharArchiveView({
               {isEditing && (
                 <div className="absolute inset-0 bg-black/30 flex flex-col items-center justify-center pointer-events-none text-white">
                   <IconCamera size={24} />
-                  <span className="ts-10 mt-1">Change Photo</span>
+                  <span className="ts-10 mt-1">{avatarBusy ? "Optimizing..." : "Change Photo"}</span>
                 </div>
               )}
             </div>
@@ -1979,6 +2090,7 @@ function CharArchiveView({
               type="file"
               accept="image/*"
               className="hidden"
+              disabled={avatarBusy}
               onChange={async (e) => {
                 const file = e.target.files?.[0];
                 if (file) await handleAvatarFile(file);
@@ -2195,9 +2307,19 @@ function CharArchiveView({
         <div className="char-archive-actions">
           {!dummy && confirmDelete ? (
             <div className="char-confirm-row">
-              <span className="char-confirm-text">CONFIRM DELETE?</span>
-              <button className="char-confirm-yes" onClick={onDelete}>YES</button>
-              <button className="char-confirm-no" onClick={() => setConfirmDelete(false)}>NO</button>
+              <span className="char-confirm-text">DELETE CHARACTER + PRIVATE CHAT?</span>
+              <button className="char-confirm-yes" disabled={deleteBusy} onClick={async () => {
+                if (deleteBusy) return;
+                setDeleteBusy(true);
+                try {
+                  await onDelete();
+                } catch (error) {
+                  console.error("[Character] delete failed:", error);
+                  setDeleteBusy(false);
+                  onNotice?.("删除失败，请重试");
+                }
+              }}>{deleteBusy ? "..." : "YES"}</button>
+              <button className="char-confirm-no" disabled={deleteBusy} onClick={() => setConfirmDelete(false)}>NO</button>
             </div>
           ) : (
             !dummy && isEditing ? (
@@ -2231,12 +2353,161 @@ function CharArchiveView({
       onBack={handleBack}
       className="bg-[var(--c-page-body-bg)]"
       rightAction={!isEditing ? (
-        <button className="char-action-btn" onClick={onEdit}>
-          <IconEdit />
-        </button>
+        <div className="flex items-center gap-2">
+          {isExisting && (
+            <button
+              className="char-action-btn"
+              onClick={openVersionHistory}
+              aria-label="角色卡历史版本"
+              title="历史版本"
+            >
+              <History size={19} />
+            </button>
+          )}
+          <button className="char-action-btn" onClick={onEdit} aria-label="编辑角色卡">
+            <IconEdit />
+          </button>
+        </div>
       ) : undefined}
     >
       {archiveFrame}
+
+      {showSaveVersionConfirm && (
+        <div className="fixed inset-0 z-[10020] flex items-center justify-center bg-black/45 px-5" role="dialog" aria-modal="true" aria-label="保存角色卡">
+          <div className="w-full max-w-sm rounded-2xl border border-[var(--c-panel-border)] bg-[var(--c-page-body-bg)] p-5 text-[var(--c-text)] shadow-2xl">
+            <div className="text-base font-bold">保存角色卡</div>
+            <p className="mt-2 ts-12 leading-relaxed opacity-75">
+              当前是 V{getCharacterCurrentVersion(char.id)}。你可以先保存修改前的旧卡，也可以覆盖当前版本。
+            </p>
+            <div className="mt-4 flex flex-col gap-2">
+              <button
+                type="button"
+                className="rounded-xl bg-[var(--c-text)] px-4 py-3 font-semibold text-[var(--c-page-body-bg)]"
+                onClick={() => {
+                  setShowSaveVersionConfirm(false);
+                  commitSave(true);
+                }}
+              >
+                备份旧卡并保存为 V{getCharacterNextVersion(char.id)}
+              </button>
+              <button
+                type="button"
+                className="rounded-xl border border-[var(--c-panel-border)] px-4 py-3 font-semibold"
+                onClick={() => {
+                  setShowSaveVersionConfirm(false);
+                  commitSave(false);
+                }}
+              >
+                覆盖当前版本
+              </button>
+              <button
+                type="button"
+                className="px-4 py-2 opacity-65"
+                onClick={() => setShowSaveVersionConfirm(false)}
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showVersions && (
+        <div
+          className="fixed inset-0 z-[10020] flex items-end justify-center bg-black/45 sm:items-center sm:px-5"
+          role="dialog"
+          aria-modal="true"
+          aria-label="角色卡历史版本"
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget) setShowVersions(false);
+          }}
+        >
+          <div className="max-h-[78vh] w-full max-w-md overflow-hidden rounded-t-2xl border border-[var(--c-panel-border)] bg-[var(--c-page-body-bg)] text-[var(--c-text)] shadow-2xl sm:rounded-2xl">
+            <div className="flex items-center justify-between border-b border-[var(--c-panel-border)] px-5 py-4">
+              <div>
+                <div className="font-bold">历史版本</div>
+                <div className="mt-0.5 ts-10 opacity-60">当前生效：V{getCharacterCurrentVersion(char.id)}</div>
+              </div>
+              <button type="button" className="px-2 py-1 font-semibold" onClick={() => setShowVersions(false)}>关闭</button>
+            </div>
+            <div className="max-h-[62vh] overflow-y-auto p-4">
+              {versions.length === 0 ? (
+                <div className="py-10 text-center ts-12 opacity-60">还没有历史版本。编辑保存或由小卷修改后会自动生成。</div>
+              ) : (
+                <div className="flex flex-col gap-3">
+                  {versions.map((version) => (
+                    <div key={version.id} className="rounded-xl border border-[var(--c-panel-border)] p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="font-bold">V{version.version}</div>
+                          <div className="mt-1 ts-10 opacity-65">{version.label}</div>
+                          <div className="mt-1 ts-10 opacity-50">{new Date(version.createdAt).toLocaleString()}</div>
+                        </div>
+                        {getCharacterCurrentVersion(char.id) === version.version && (
+                          <span className="shrink-0 rounded-full border border-[var(--c-panel-border)] px-2 py-1 ts-10">当前</span>
+                        )}
+                      </div>
+                      <div className="mt-3 rounded-lg bg-black/5 p-3 ts-11 dark:bg-white/5">
+                        <div className="font-semibold">{version.data.name || "未命名角色"}</div>
+                        <div className="mt-1 line-clamp-3 whitespace-pre-wrap opacity-65">
+                          {version.data.persona || version.data.personality || "（无角色设定）"}
+                        </div>
+                      </div>
+                      <div className="mt-3 flex gap-2">
+                        <button
+                          type="button"
+                          className="flex-1 rounded-lg bg-[var(--c-text)] px-3 py-2 ts-12 font-semibold text-[var(--c-page-body-bg)] disabled:opacity-40"
+                          disabled={getCharacterCurrentVersion(char.id) === version.version}
+                          onClick={() => setRestoreTarget(version)}
+                        >
+                          切换到 V{version.version}
+                        </button>
+                        <button
+                          type="button"
+                          className="rounded-lg border border-red-400/60 px-3 py-2 ts-12 text-red-600"
+                          onClick={() => setDeleteVersionTarget(version)}
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {restoreTarget && (
+        <ConfirmDialog
+          title={`切换到 V${restoreTarget.version}？`}
+          message="当前角色卡会切换为该快照。切走前会同步保存当前版本，切换本身不会创建新版本号。"
+          icon={History}
+          confirmLabel="确认切换"
+          cancelLabel="取消"
+          onConfirm={() => {
+            const target = restoreTarget;
+            setRestoreTarget(null);
+            setShowVersions(false);
+            onRestoreVersion?.(target);
+          }}
+          onCancel={() => setRestoreTarget(null)}
+        />
+      )}
+
+      {deleteVersionTarget && (
+        <ConfirmDialog
+          title={`删除 V${deleteVersionTarget.version}？`}
+          message="此历史快照删除后无法恢复，不会删除当前角色卡。"
+          icon={AlertCircle}
+          variant="danger"
+          confirmLabel="删除版本"
+          cancelLabel="取消"
+          onConfirm={() => removeVersion(deleteVersionTarget)}
+          onCancel={() => setDeleteVersionTarget(null)}
+        />
+      )}
 
       {isEditing && showTimeZonePicker && (
         <div
@@ -2399,40 +2670,88 @@ function AutoResizingTextarea({
 
 // ── 工具函数 ─────────────────────────────────────────
 
-function fileToDataUrl(file: File): Promise<string> {
+type ImageCompressionAttempt = { maxSize: number; quality: number };
+
+function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => {
-      const img = new Image();
-      img.onload = () => {
-        const MAX_SIZE = 400;
-        let w = img.width;
-        let h = img.height;
-        if (w > MAX_SIZE || h > MAX_SIZE) {
-          if (w > h) {
-            h = Math.round(h * MAX_SIZE / w);
-            w = MAX_SIZE;
-          } else {
-            w = Math.round(w * MAX_SIZE / h);
-            h = MAX_SIZE;
-          }
-        }
-        const canvas = document.createElement("canvas");
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) return resolve(reader.result as string);
-        ctx.drawImage(img, 0, 0, w, h);
-
-        // Use webp or jpeg to heavily compress large png files before saving to localstorage
-        resolve(canvas.toDataURL("image/webp", 0.8));
-      };
-      img.onerror = () => resolve(reader.result as string); // fallback to raw
-      img.src = reader.result as string;
-    };
-    reader.onerror = reject;
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("读取图片失败"));
     reader.readAsDataURL(file);
   });
+}
+
+function loadDataUrlImage(dataUrl: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("无法解析图片，请更换图片"));
+    img.src = dataUrl;
+  });
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, quality: number): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      blob => blob ? resolve(blob) : reject(new Error("图片编码失败，请更换图片")),
+      "image/webp",
+      quality,
+    );
+  });
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("读取压缩图片失败"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function fileToDataUrl(
+  file: File,
+  options: {
+    maxSize?: number;
+    quality?: number;
+    maxBytes?: number;
+    fallbacks?: readonly ImageCompressionAttempt[];
+  } = {},
+): Promise<string> {
+  const sourceDataUrl = await readFileAsDataUrl(file);
+  const maxSize = options.maxSize ?? 400;
+  const quality = options.quality ?? 0.8;
+
+  try {
+    const img = await loadDataUrlImage(sourceDataUrl);
+    const attempts: ImageCompressionAttempt[] = [
+      { maxSize, quality },
+      ...(options.fallbacks ?? []),
+    ];
+    const canvas = document.createElement("canvas");
+
+    for (const attempt of attempts) {
+      const scale = Math.min(1, attempt.maxSize / Math.max(img.width, img.height));
+      const width = Math.max(1, Math.round(img.width * scale));
+      const height = Math.max(1, Math.round(img.height * scale));
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("当前浏览器无法处理图片，请更换图片");
+      ctx.drawImage(img, 0, 0, width, height);
+
+      const blob = await canvasToBlob(canvas, attempt.quality);
+      if (!options.maxBytes || blob.size <= options.maxBytes) {
+        return await blobToDataUrl(blob);
+      }
+    }
+
+    throw new Error(`图片压缩后仍超过 ${Math.ceil((options.maxBytes ?? 0) / 1024)}KB，请更换图片`);
+  } catch (error) {
+    // 旧调用未要求体积上限时维持原有兼容兜底；角色头像的受限链路绝不保存原始大图。
+    if (!options.maxBytes) return sourceDataUrl;
+    throw error;
+  }
 }
 
 // ── 图标 ─────────────────────────────────────────────
